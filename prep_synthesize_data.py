@@ -46,6 +46,8 @@ COMMIT_INTERVAL   = 500
 def prepare_dataset():
     import torch
     import torchaudio
+    import torchaudio.transforms
+    import librosa
     import numpy as np
     from model import SpeakerEncoder
 
@@ -61,8 +63,11 @@ def prepare_dataset():
     clean_sd = {k.replace("_orig_mod.", ""): v for k, v in raw_sd.items()}
     model.load_state_dict(clean_sd, strict=False)
     model.eval()
+    logger.info("✅ Encoder loaded successfully")
 
     # 2. Build BOTH mel pipelines - 40-bin for encoder, 80-bin for Tacotron
+    logger.info("Building mel-spectrogram pipelines...")
+    
     # 40-bin encoder pipeline (16kHz)
     enc_mel_pipeline = torch.nn.Sequential(
         torchaudio.transforms.MelSpectrogram(
@@ -90,17 +95,21 @@ def prepare_dataset():
         ),
         torchaudio.transforms.AmplitudeToDB(stype="magnitude", top_db=80)
     ).to(device)
+    logger.info("✅ Pipelines built successfully")
 
     # 3. Scan for Raw Audio files (we'll generate both mels on-the-fly)
+    logger.info("Scanning for audio files...")
     wav_files = glob.glob(f"{RAW_LIBRITTS_PATH}/**/*.wav", recursive=True)
-    logger.info(f"Found {len(wav_files)} audio files.")
+    logger.info(f"✅ Found {len(wav_files)} audio files.")
     
     metadata = []
     processed_count = 0
     skipped_count = 0
+    error_count = 0
 
+    logger.info("Starting processing loop...")
     with torch.no_grad():
-        for wav_path in wav_files:
+        for idx, wav_path in enumerate(wav_files):
             base = Path(wav_path).stem
             txt_path = wav_path.replace(".wav", ".normalized.txt")
             
@@ -114,27 +123,31 @@ def prepare_dataset():
                     skipped_count += 1
                     continue
 
-                # --- A. ENCODER PASS: Generate 40-bin mel at 16kHz ---
-                wav_16k, sr = torchaudio.load(wav_path)
-                if sr != ENC_SAMPLE_RATE:
-                    wav_16k = torchaudio.functional.resample(wav_16k, sr, ENC_SAMPLE_RATE)
-                if wav_16k.shape[0] > 1:
-                    wav_16k = wav_16k.mean(dim=0, keepdim=True)
+                # --- A. ENCODER PASS: Generate 40-bin mel at 16kHz using LIBROSA ---
+                try:
+                    wav_16k, _ = librosa.load(wav_path, sr=ENC_SAMPLE_RATE, mono=True)
+                    wav_16k_tensor = torch.from_numpy(wav_16k).unsqueeze(0).to(device)
+                except Exception as e:
+                    logger.warning(f"Librosa failed to load {base} at 16kHz: {e}")
+                    error_count += 1
+                    continue
                 
-                mel_40 = enc_mel_pipeline(wav_16k.to(device))  # [1, 40, T]
+                mel_40 = enc_mel_pipeline(wav_16k_tensor)  # [1, 40, T]
                 mel_40_input = mel_40.permute(0, 2, 1)  # [1, T, 40] for LSTM
                 
                 output = model(mel_40_input)
                 embedding = (output[0] if isinstance(output, tuple) else output).squeeze(0).cpu()
 
-                # --- B. TACOTRON PASS: Generate 80-bin mel at 22.05kHz ---
-                wav_22k, sr = torchaudio.load(wav_path)
-                if sr != TACO_SAMPLE_RATE:
-                    wav_22k = torchaudio.functional.resample(wav_22k, sr, TACO_SAMPLE_RATE)
-                if wav_22k.shape[0] > 1:
-                    wav_22k = wav_22k.mean(dim=0, keepdim=True)
+                # --- B. TACOTRON PASS: Generate 80-bin mel at 22.05kHz using LIBROSA ---
+                try:
+                    wav_22k, _ = librosa.load(wav_path, sr=TACO_SAMPLE_RATE, mono=True)
+                    wav_22k_tensor = torch.from_numpy(wav_22k).unsqueeze(0).to(device)
+                except Exception as e:
+                    logger.warning(f"Librosa failed to load {base} at 22.05kHz: {e}")
+                    error_count += 1
+                    continue
                     
-                mel_80 = taco_mel_pipeline(wav_22k.to(device)).squeeze(0).cpu()  # [80, T]
+                mel_80 = taco_mel_pipeline(wav_22k_tensor).squeeze(0).cpu()  # [80, T]
 
                 # --- C. SAVE TRIPLETS ---
                 emb_p = os.path.join(OUTPUT_DIR, f"{base}_embed.pt")
@@ -145,19 +158,37 @@ def prepare_dataset():
                 metadata.append(f"{base}|{text}|{emb_p}|{mel_p}")
                 
                 processed_count += 1
+                
+                # Log progress every 100 files
+                if processed_count % 100 == 0:
+                    logger.info(f"📊 Progress: {processed_count}/{len(wav_files)} processed | Skipped: {skipped_count} | Errors: {error_count}")
+                
+                # Commit to volume every 500 files
                 if processed_count % LOG_INTERVAL == 0:
-                    logger.info(f"Processed {processed_count}/{len(wav_files)} files... (Skipped: {skipped_count})")
+                    logger.info(f"💾 Committing to volume at {processed_count} files...")
                     volume.commit()
+                    logger.info("✅ Volume committed")
 
             except Exception as e:
-                logger.warning(f"Error on {base}: {e}")
-                skipped_count += 1
+                logger.warning(f"❌ Error processing {base}: {e}")
+                error_count += 1
 
     # Write metadata
+    logger.info(f"Writing metadata file...")
     meta_path = os.path.join(OUTPUT_DIR, "train_metadata.txt")
     Path(meta_path).write_text("\n".join(metadata), encoding="utf-8")
+    
+    logger.info(f"Final commit to volume...")
     volume.commit()
-    logger.info(f"✅ Done. Saved {processed_count} triplets to {OUTPUT_DIR} (Skipped: {skipped_count})")
+    
+    logger.info("=" * 60)
+    logger.info(f"✅ PHASE 4 COMPLETE")
+    logger.info(f"📁 Output directory: {OUTPUT_DIR}")
+    logger.info(f"✅ Successfully processed: {processed_count} files")
+    logger.info(f"⏭️  Skipped (no text): {skipped_count} files")
+    logger.info(f"❌ Errors: {error_count} files")
+    logger.info(f"📄 Metadata entries: {len(metadata)}")
+    logger.info("=" * 60)
 
 
 @app.local_entrypoint()
