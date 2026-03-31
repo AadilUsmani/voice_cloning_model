@@ -13,15 +13,8 @@ volume = modal.Volume.from_name("libritts-volume")
 
 image = (
     modal.Image.debian_slim()
-    .pip_install(
-        "torch",
-        "torchcodec",
-        "torchaudio",
-        "numpy",
-        "librosa",
-        "soundfile",
-        "tqdm"
-    )
+    .apt_install("ffmpeg")
+    .pip_install("torch", "torchaudio", "numpy", "librosa", "soundfile", "tqdm")
     .add_local_file("model.py", remote_path="/root/model.py")
 )
 
@@ -91,7 +84,8 @@ def load_audio(wav_path: str, target_sr: int, device: torch.device) -> torch.Ten
 def prepare_dataset():
     import torchaudio
     import torchaudio.transforms
-    import torchaudio.functional
+    import librosa
+    import numpy as np
     
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
     from model import SpeakerEncoder
@@ -128,14 +122,12 @@ def prepare_dataset():
         ).to(device)
 
     def load_audio_local(wav_path: str, target_sr: int) -> torch.Tensor:
-        """Loads a wav file, resamples if needed, returns a [1, T] tensor on device."""
-        wav, sr = torchaudio.load(wav_path)
-        if sr != target_sr:
-            wav = torchaudio.functional.resample(wav, orig_freq=sr, new_freq=target_sr)
-        # Mix down to mono if stereo
-        if wav.shape[0] > 1:
-            wav = wav.mean(dim=0, keepdim=True)
-        return wav.to(device)
+        """Loads a wav file using librosa, returns a [1, T] tensor on device."""
+        # Use librosa - more stable and doesn't require GPU-specific libraries
+        wav, _ = librosa.load(wav_path, sr=target_sr, mono=True)
+        # Convert numpy array to torch tensor and add batch dimension
+        wav_tensor = torch.from_numpy(wav).unsqueeze(0)
+        return wav_tensor.to(device)
 
     # --- Load Encoder (once) ---
     logger.info("Loading encoder checkpoint...")
