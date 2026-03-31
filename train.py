@@ -76,6 +76,12 @@ def train_model():
     # --- Data ---
     dataset = ShardedMelDataset()
     
+    # Load speaker mapping from shard 0 to get actual speaker count
+    shard_0_path = "/data/dataset_shard_0.pt"
+    shard_0 = torch.load(shard_0_path, weights_only=True)
+    n_speakers = len(shard_0.get("mapping", {}))
+    logger.info(f"Detected {n_speakers} unique speakers in dataset")
+    
     # Build the smart sampler
     my_sampler = MPerClassSampler(
         dataset.label_cache, 
@@ -94,7 +100,7 @@ def train_model():
     )
 
     # --- Model ---
-    model = SpeakerEncoder().to(device)
+    model = SpeakerEncoder(n_speakers=n_speakers).to(device)
 
     # torch.compile traces the model into optimized kernels — free ~10-20% GPU speedup
     # on PyTorch 2.x with no code changes to the model itself
@@ -104,7 +110,8 @@ def train_model():
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
 
     miner = miners.BatchHardMiner()
-    loss_func = losses.TripletMarginLoss(margin=0.2)
+    triplet_loss_func = losses.TripletMarginLoss(margin=0.2)
+    ce_loss_func = torch.nn.CrossEntropyLoss().to(device)
 
     logger.info(f"Starting training on {device} for {EPOCHS} epochs...")
     best_loss = float("inf")
@@ -112,6 +119,8 @@ def train_model():
     for epoch in range(EPOCHS):
         model.train()
         total_loss = 0.0
+        total_triplet = 0.0
+        total_ce = 0.0
         pbar = tqdm(dataloader, desc=f"Epoch {epoch + 1}/{EPOCHS}")
 
         for batch_idx, (mels, labels) in enumerate(pbar):
@@ -120,9 +129,13 @@ def train_model():
 
             optimizer.zero_grad(set_to_none=True)
 
-            embeddings = model(mels)
+            embeddings, logits = model(mels)
             hard_pairs = miner(embeddings, labels)
-            loss = loss_func(embeddings, labels, hard_pairs)
+            loss_triplet = triplet_loss_func(embeddings, labels, hard_pairs)
+            loss_ce = ce_loss_func(logits, labels)
+            
+            # Combine both losses
+            loss = loss_triplet + loss_ce
 
             # Skip backward when no valid triplets exist in the batch
             if loss.item() > 0:
@@ -131,7 +144,13 @@ def train_model():
                 optimizer.step()
 
             total_loss += loss.item()
-            pbar.set_postfix({"avg_loss": f"{total_loss / (batch_idx + 1):.4f}"})
+            total_triplet += loss_triplet.item()
+            total_ce += loss_ce.item()
+            pbar.set_postfix({
+                "loss": f"{total_loss / (batch_idx + 1):.4f}",
+                "triplet": f"{total_triplet / (batch_idx + 1):.4f}",
+                "ce": f"{total_ce / (batch_idx + 1):.4f}"
+            })
 
         scheduler.step()
         epoch_loss = total_loss / len(dataloader)
