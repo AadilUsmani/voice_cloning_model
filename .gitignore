@@ -32,3 +32,6 @@ checkpoints/
 # Logs
 *.log
 logs/
+
+# Generated visualizations
+*.png
