@@ -62,7 +62,22 @@ def prepare_dataset():
     model.load_state_dict(clean_sd, strict=False)
     model.eval()
 
-    # 2. Build the 80-bin Mel Pipeline (Target for Tacotron)
+    # 2. Build BOTH mel pipelines - 40-bin for encoder, 80-bin for Tacotron
+    # 40-bin encoder pipeline (16kHz)
+    enc_mel_pipeline = torch.nn.Sequential(
+        torchaudio.transforms.MelSpectrogram(
+            sample_rate=ENC_SAMPLE_RATE,
+            n_fft=ENC_N_FFT,
+            win_length=ENC_WIN_LENGTH,
+            hop_length=ENC_HOP_LENGTH,
+            n_mels=ENC_N_MELS,
+            power=2.0,
+            normalized=False
+        ),
+        torchaudio.transforms.AmplitudeToDB(stype="power", top_db=80)
+    ).to(device)
+    
+    # 80-bin Tacotron pipeline (22.05kHz)
     taco_mel_pipeline = torch.nn.Sequential(
         torchaudio.transforms.MelSpectrogram(
             sample_rate=TACO_SAMPLE_RATE, 
@@ -76,49 +91,52 @@ def prepare_dataset():
         torchaudio.transforms.AmplitudeToDB(stype="magnitude", top_db=80)
     ).to(device)
 
-    # 3. Scan for Raw Audio (To get Text + 80-bin Mel)
+    # 3. Scan for Raw Audio files (we'll generate both mels on-the-fly)
     wav_files = glob.glob(f"{RAW_LIBRITTS_PATH}/**/*.wav", recursive=True)
     logger.info(f"Found {len(wav_files)} audio files.")
     
     metadata = []
     processed_count = 0
+    skipped_count = 0
 
     with torch.no_grad():
         for wav_path in wav_files:
             base = Path(wav_path).stem
             txt_path = wav_path.replace(".wav", ".normalized.txt")
             
-            # Look for the Phase 2 Preprocessed 40-bin Mel (for the Encoder)
-            # Extract speaker ID from path: /data/LibriTTS/train-clean-100/{speaker_id}/{chapter_id}/{base}.wav
-            path_parts = Path(wav_path).parts
-            speaker_id = path_parts[-3]  # Get speaker_id from directory structure
-            npy_path = f"/data/melspectrograms/{speaker_id}/{base}.npy"
-            
-            if not os.path.exists(txt_path) or not os.path.exists(npy_path):
+            if not os.path.exists(txt_path):
+                skipped_count += 1
                 continue
 
             try:
-                # --- A. ENCODER PASS (IDENTITY) ---
-                # Load the 40-bin mel from Phase 2
-                mel_40 = np.load(npy_path)
-                mel_40_tensor = torch.from_numpy(mel_40).float().unsqueeze(0).to(device) # [1, 40, T]
+                text = Path(txt_path).read_text(encoding="utf-8").strip()
+                if len(text) < 2:
+                    skipped_count += 1
+                    continue
+
+                # --- A. ENCODER PASS: Generate 40-bin mel at 16kHz ---
+                wav_16k, sr = torchaudio.load(wav_path)
+                if sr != ENC_SAMPLE_RATE:
+                    wav_16k = torchaudio.functional.resample(wav_16k, sr, ENC_SAMPLE_RATE)
+                if wav_16k.shape[0] > 1:
+                    wav_16k = wav_16k.mean(dim=0, keepdim=True)
                 
-                # CRITICAL FIX: Transpose from [1, 40, T] to [1, T, 40] for the LSTM
-                mel_40_input = mel_40_tensor.permute(0, 2, 1) 
+                mel_40 = enc_mel_pipeline(wav_16k.to(device))  # [1, 40, T]
+                mel_40_input = mel_40.permute(0, 2, 1)  # [1, T, 40] for LSTM
                 
                 output = model(mel_40_input)
                 embedding = (output[0] if isinstance(output, tuple) else output).squeeze(0).cpu()
 
-                # --- B. TACOTRON PASS (TARGET SPEECH) ---
-                wav, sr = torchaudio.load(wav_path)
+                # --- B. TACOTRON PASS: Generate 80-bin mel at 22.05kHz ---
+                wav_22k, sr = torchaudio.load(wav_path)
                 if sr != TACO_SAMPLE_RATE:
-                    wav = torchaudio.functional.resample(wav, sr, TACO_SAMPLE_RATE)
-                if wav.shape[0] > 1:
-                    wav = wav.mean(dim=0, keepdim=True)
-                mel_80 = taco_mel_pipeline(wav.to(device)).squeeze(0).cpu()
+                    wav_22k = torchaudio.functional.resample(wav_22k, sr, TACO_SAMPLE_RATE)
+                if wav_22k.shape[0] > 1:
+                    wav_22k = wav_22k.mean(dim=0, keepdim=True)
+                    
+                mel_80 = taco_mel_pipeline(wav_22k.to(device)).squeeze(0).cpu()  # [80, T]
 
-                # --- C. SAVE ---
-                text = Path(txt_path).read_text(encoding="utf-8").strip()
+                # --- C. SAVE TRIPLETS ---
                 emb_p = os.path.join(OUTPUT_DIR, f"{base}_embed.pt")
                 mel_p = os.path.join(OUTPUT_DIR, f"{base}_mel.pt")
                 
@@ -128,17 +146,18 @@ def prepare_dataset():
                 
                 processed_count += 1
                 if processed_count % LOG_INTERVAL == 0:
-                    logger.info(f"Processed {processed_count}/{len(wav_files)} files...")
+                    logger.info(f"Processed {processed_count}/{len(wav_files)} files... (Skipped: {skipped_count})")
                     volume.commit()
 
             except Exception as e:
                 logger.warning(f"Error on {base}: {e}")
+                skipped_count += 1
 
     # Write metadata
     meta_path = os.path.join(OUTPUT_DIR, "train_metadata.txt")
     Path(meta_path).write_text("\n".join(metadata), encoding="utf-8")
     volume.commit()
-    logger.info(f"✅ Done. Saved {processed_count} triplets to {OUTPUT_DIR}")
+    logger.info(f"✅ Done. Saved {processed_count} triplets to {OUTPUT_DIR} (Skipped: {skipped_count})")
 
 
 @app.local_entrypoint()
