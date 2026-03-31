@@ -42,94 +42,19 @@ LOG_INTERVAL      = 500
 COMMIT_INTERVAL   = 500
 
 
-def build_mel_pipeline(
-    sample_rate: int,
-    n_fft: int,
-    win_length: int,
-    hop_length: int,
-    n_mels: int,
-    f_max: int | None = None,
-    power: float = 2.0,
-    normalized: bool = False,
-    device: torch.device = torch.device("cpu"),
-) -> torch.nn.Sequential:
-    """Builds a reusable MelSpectrogram + AmplitudeToDB pipeline on the given device."""
-    return torch.nn.Sequential(
-        torchaudio.transforms.MelSpectrogram(
-            sample_rate=sample_rate,
-            n_fft=n_fft,
-            win_length=win_length,
-            hop_length=hop_length,
-            f_max=f_max,
-            n_mels=n_mels,
-            power=power,
-            normalized=normalized,
-        ),
-        torchaudio.transforms.AmplitudeToDB(stype="magnitude", top_db=80),
-    ).to(device)
-
-
-def load_audio(wav_path: str, target_sr: int, device: torch.device) -> torch.Tensor:
-    """Loads a wav file, resamples if needed, returns a [1, T] tensor on device."""
-    wav, sr = torchaudio.load(wav_path)
-    if sr != target_sr:
-        wav = torchaudio.functional.resample(wav, orig_freq=sr, new_freq=target_sr)
-    # Mix down to mono if stereo
-    if wav.shape[0] > 1:
-        wav = wav.mean(dim=0, keepdim=True)
-    return wav.to(device)
-
-
 @app.function(image=image, volumes={"/data": volume}, timeout=3600, gpu="T4")
 def prepare_dataset():
+    import torch
     import torchaudio
-    import torchaudio.transforms
-    import librosa
     import numpy as np
-    
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
     from model import SpeakerEncoder
 
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info(f"Starting preparation on {device}...")
-
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-    # --- Helper function with torchaudio access ---
-    def build_mel_pipeline_local(
-        sample_rate: int,
-        n_fft: int,
-        win_length: int,
-        hop_length: int,
-        n_mels: int,
-        f_max: int | None = None,
-        power: float = 2.0,
-        normalized: bool = False,
-    ) -> torch.nn.Sequential:
-        """Builds a reusable MelSpectrogram + AmplitudeToDB pipeline on the given device."""
-        return torch.nn.Sequential(
-            torchaudio.transforms.MelSpectrogram(
-                sample_rate=sample_rate,
-                n_fft=n_fft,
-                win_length=win_length,
-                hop_length=hop_length,
-                f_max=f_max,
-                n_mels=n_mels,
-                power=power,
-                normalized=normalized,
-            ),
-            torchaudio.transforms.AmplitudeToDB(stype="magnitude", top_db=80),
-        ).to(device)
-
-    def load_audio_local(wav_path: str, target_sr: int) -> torch.Tensor:
-        """Loads a wav file using librosa, returns a [1, T] tensor on device."""
-        # Use librosa - more stable and doesn't require GPU-specific libraries
-        wav, _ = librosa.load(wav_path, sr=target_sr, mono=True)
-        # Convert numpy array to torch tensor and add batch dimension
-        wav_tensor = torch.from_numpy(wav).unsqueeze(0)
-        return wav_tensor.to(device)
-
-    # --- Load Encoder (once) ---
+    # 1. Load Encoder with correct input_size
     logger.info("Loading encoder checkpoint...")
     model = SpeakerEncoder(n_speakers=N_SPEAKERS).to(device)
     raw_sd = torch.load(CHECKPOINT_PATH, map_location=device, weights_only=True)
@@ -137,67 +62,82 @@ def prepare_dataset():
     model.load_state_dict(clean_sd, strict=False)
     model.eval()
 
-    # --- Build Mel Pipelines (once, reused every iteration) ---
-    enc_mel_pipeline  = build_mel_pipeline_local(
-        ENC_SAMPLE_RATE, ENC_N_FFT, ENC_WIN_LENGTH, ENC_HOP_LENGTH, ENC_N_MELS
-    )
-    taco_mel_pipeline = build_mel_pipeline_local(
-        TACO_SAMPLE_RATE, TACO_N_FFT, TACO_WIN_LENGTH, TACO_HOP_LENGTH, TACO_N_MELS,
-        f_max=8000, power=1.0, normalized=True
-    )
+    # 2. Build the 80-bin Mel Pipeline (Target for Tacotron)
+    taco_mel_pipeline = torch.nn.Sequential(
+        torchaudio.transforms.MelSpectrogram(
+            sample_rate=TACO_SAMPLE_RATE, 
+            n_fft=TACO_N_FFT, 
+            win_length=TACO_WIN_LENGTH, 
+            hop_length=TACO_HOP_LENGTH, 
+            n_mels=TACO_N_MELS, 
+            power=1.0, 
+            normalized=True
+        ),
+        torchaudio.transforms.AmplitudeToDB(stype="magnitude", top_db=80)
+    ).to(device)
 
-    # --- Scan Files ---
+    # 3. Scan for Raw Audio (To get Text + 80-bin Mel)
     wav_files = glob.glob(f"{RAW_LIBRITTS_PATH}/**/*.wav", recursive=True)
     logger.info(f"Found {len(wav_files)} audio files.")
-
+    
     metadata = []
     processed_count = 0
 
     with torch.no_grad():
         for wav_path in wav_files:
+            base = Path(wav_path).stem
             txt_path = wav_path.replace(".wav", ".normalized.txt")
-            if not os.path.exists(txt_path):
-                continue
-
-            text = Path(txt_path).read_text(encoding="utf-8").strip()
-            if len(text) < 2:
+            
+            # Look for the Phase 2 Preprocessed 40-bin Mel (for the Encoder)
+            # Extract speaker ID from path: /data/LibriTTS/train-clean-100/{speaker_id}/{chapter_id}/{base}.wav
+            path_parts = Path(wav_path).parts
+            speaker_id = path_parts[-3]  # Get speaker_id from directory structure
+            npy_path = f"/data/melspectrograms/{speaker_id}/{base}.npy"
+            
+            if not os.path.exists(txt_path) or not os.path.exists(npy_path):
                 continue
 
             try:
-                # A. Speaker embedding (256D)
-                wav_enc = load_audio_local(wav_path, ENC_SAMPLE_RATE)
-                mel_enc = enc_mel_pipeline(wav_enc)           # [1, 40, T]
-                output  = model(mel_enc)
-                embedding = (output[0] if isinstance(output, tuple) else output)
-                embedding = embedding.squeeze(0).cpu()        # [256]
+                # --- A. ENCODER PASS (IDENTITY) ---
+                # Load the 40-bin mel from Phase 2
+                mel_40 = np.load(npy_path)
+                mel_40_tensor = torch.from_numpy(mel_40).float().unsqueeze(0).to(device) # [1, 40, T]
+                
+                # CRITICAL FIX: Transpose from [1, 40, T] to [1, T, 40] for the LSTM
+                mel_40_input = mel_40_tensor.permute(0, 2, 1) 
+                
+                output = model(mel_40_input)
+                embedding = (output[0] if isinstance(output, tuple) else output).squeeze(0).cpu()
 
-                # B. Tacotron target mel (80D)
-                wav_taco = load_audio_local(wav_path, TACO_SAMPLE_RATE)
-                mel_taco = taco_mel_pipeline(wav_taco).squeeze(0).cpu()  # [80, T]
+                # --- B. TACOTRON PASS (TARGET SPEECH) ---
+                wav, sr = torchaudio.load(wav_path)
+                if sr != TACO_SAMPLE_RATE:
+                    wav = torchaudio.functional.resample(wav, sr, TACO_SAMPLE_RATE)
+                if wav.shape[0] > 1:
+                    wav = wav.mean(dim=0, keepdim=True)
+                mel_80 = taco_mel_pipeline(wav.to(device)).squeeze(0).cpu()
 
-                # C. Save artifacts
-                base      = Path(wav_path).stem
-                emb_path  = os.path.join(OUTPUT_DIR, f"{base}_embed.pt")
-                mel_path  = os.path.join(OUTPUT_DIR, f"{base}_mel.pt")
-
-                torch.save(embedding, emb_path)
-                torch.save(mel_taco,  mel_path)
-
-                metadata.append(f"{base}|{text}|{emb_path}|{mel_path}")
+                # --- C. SAVE ---
+                text = Path(txt_path).read_text(encoding="utf-8").strip()
+                emb_p = os.path.join(OUTPUT_DIR, f"{base}_embed.pt")
+                mel_p = os.path.join(OUTPUT_DIR, f"{base}_mel.pt")
+                
+                torch.save(embedding, emb_p)
+                torch.save(mel_80, mel_p)
+                metadata.append(f"{base}|{text}|{emb_p}|{mel_p}")
+                
                 processed_count += 1
-
                 if processed_count % LOG_INTERVAL == 0:
                     logger.info(f"Processed {processed_count}/{len(wav_files)} files...")
                     volume.commit()
 
             except Exception as e:
-                logger.warning(f"Skipping {wav_path}: {e}")
+                logger.warning(f"Error on {base}: {e}")
 
-    # --- Write Metadata ---
+    # Write metadata
     meta_path = os.path.join(OUTPUT_DIR, "train_metadata.txt")
     Path(meta_path).write_text("\n".join(metadata), encoding="utf-8")
     volume.commit()
-
     logger.info(f"✅ Done. Saved {processed_count} triplets to {OUTPUT_DIR}")
 
 
