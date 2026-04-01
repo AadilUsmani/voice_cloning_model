@@ -2,14 +2,8 @@ import os
 import glob
 import torch
 import modal
-import logging
+import numpy as np
 from pathlib import Path
-
-logger = logging.getLogger(__name__)
-
-# --- Modal Setup ---
-app = modal.App("fyp-synth-prep")
-volume = modal.Volume.from_name("libritts-volume")
 
 image = (
     modal.Image.debian_slim()
@@ -18,182 +12,119 @@ image = (
     .add_local_file("model.py", remote_path="/root/model.py")
 )
 
-# --- Paths ---
-RAW_LIBRITTS_PATH = "/data/LibriTTS/train-clean-100"
-CHECKPOINT_PATH   = "/data/checkpoints/encoder_best.pth"
-OUTPUT_DIR        = "/data/synthesizer_dataset"
+app = modal.App("fyp-phase4-resume")
+volume = modal.Volume.from_name("libritts-volume")
 
-# --- Encoder Mel Config (16kHz, 40-bin) ---
-ENC_SAMPLE_RATE = 16000
-ENC_N_FFT       = 400
-ENC_HOP_LENGTH  = 160
-ENC_WIN_LENGTH  = 400
-ENC_N_MELS      = 40
+RAW_WAV_DIR = "/data/LibriTTS/train-clean-100"
+PHASE2_NPY_DIR = "/data/melspectrograms"
+OUTPUT_DIR = "/data/synthesizer_dataset"
 
-# --- Tacotron Mel Config (22050Hz, 80-bin) ---
-TACO_SAMPLE_RATE = 22050
-TACO_N_FFT       = 1024
-TACO_HOP_LENGTH  = 256
-TACO_WIN_LENGTH  = 1024
-TACO_N_MELS      = 80
-
-N_SPEAKERS        = 245
-LOG_INTERVAL      = 500
-COMMIT_INTERVAL   = 500
-
-
-@app.function(image=image, volumes={"/data": volume}, timeout=3600, gpu="T4")
+@app.function(image=image, volumes={"/data": volume}, timeout=7200, gpu="T4")
 def prepare_dataset():
-    import torch
-    import torchaudio
-    import torchaudio.transforms
     import librosa
-    import numpy as np
-    from model import SpeakerEncoder
-
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    logger.info(f"Starting preparation on {device}...")
+    import torchaudio
+    
+    device = torch.device("cuda")
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-    # 1. Load Encoder with correct input_size
-    logger.info("Loading encoder checkpoint...")
-    model = SpeakerEncoder(n_speakers=N_SPEAKERS).to(device)
-    raw_sd = torch.load(CHECKPOINT_PATH, map_location=device, weights_only=True)
-    clean_sd = {k.replace("_orig_mod.", ""): v for k, v in raw_sd.items()}
-    model.load_state_dict(clean_sd, strict=False)
+    # 1. Load Encoder
+    from model import SpeakerEncoder 
+    model = SpeakerEncoder().to(device)
+    state_dict = torch.load("/data/checkpoints/encoder_best.pth", map_location=device)
+    state_dict = {k.replace("_orig_mod.", ""): v for k, v in state_dict.items()}
+    state_dict.pop("classifier.weight", None)
+    state_dict.pop("classifier.bias", None)
+    model.load_state_dict(state_dict, strict=False)
     model.eval()
-    logger.info("✅ Encoder loaded successfully")
 
-    # 2. Build BOTH mel pipelines - 40-bin for encoder, 80-bin for Tacotron
-    logger.info("Building mel-spectrogram pipelines...")
-    
-    # 40-bin encoder pipeline (16kHz)
-    enc_mel_pipeline = torch.nn.Sequential(
-        torchaudio.transforms.MelSpectrogram(
-            sample_rate=ENC_SAMPLE_RATE,
-            n_fft=ENC_N_FFT,
-            win_length=ENC_WIN_LENGTH,
-            hop_length=ENC_HOP_LENGTH,
-            n_mels=ENC_N_MELS,
-            power=2.0,
-            normalized=False
-        ),
-        torchaudio.transforms.AmplitudeToDB(stype="power", top_db=80)
+    # 2. Mel Pipeline
+    mel_transform = torchaudio.transforms.MelSpectrogram(
+        sample_rate=22050, n_fft=1024, win_length=1024, hop_length=256, n_mels=80
     ).to(device)
-    
-    # 80-bin Tacotron pipeline (22.05kHz)
-    taco_mel_pipeline = torch.nn.Sequential(
-        torchaudio.transforms.MelSpectrogram(
-            sample_rate=TACO_SAMPLE_RATE, 
-            n_fft=TACO_N_FFT, 
-            win_length=TACO_WIN_LENGTH, 
-            hop_length=TACO_HOP_LENGTH, 
-            n_mels=TACO_N_MELS, 
-            power=1.0, 
-            normalized=True
-        ),
-        torchaudio.transforms.AmplitudeToDB(stype="magnitude", top_db=80)
-    ).to(device)
-    logger.info("✅ Pipelines built successfully")
 
-    # 3. Scan for Raw Audio files (we'll generate both mels on-the-fly)
-    logger.info("Scanning for audio files...")
-    wav_files = glob.glob(f"{RAW_LIBRITTS_PATH}/**/*.wav", recursive=True)
-    logger.info(f"✅ Found {len(wav_files)} audio files.")
+    # --- THE INDEXING PHASE (Do it ONCE, in memory) ---
+    print("🔄 Forcing volume sync...")
+    volume.reload()
     
-    metadata = []
+    wav_files = glob.glob(f"{RAW_WAV_DIR}/**/*.wav", recursive=True)
+    
+    print("🔍 Indexing completed files...")
+    existing_files = glob.glob(f"{OUTPUT_DIR}/*_embed.pt")
+    completed_ids = {Path(f).name.replace("_embed.pt", "") for f in existing_files}
+    
+    print("🔍 Indexing Phase 2 NPY files... (This takes a few seconds)")
+    all_npy_files = glob.glob(f"{PHASE2_NPY_DIR}/**/*.npy", recursive=True)
+    # Create an instant dictionary lookup mapping filename -> full path
+    npy_map = {Path(f).name: f for f in all_npy_files}
+        
+    print(f"🚀 Found {len(wav_files)} total files. Already completed: {len(completed_ids)}. Resuming...")
+    # ------------------------------------------------------
+
     processed_count = 0
-    skipped_count = 0
-    error_count = 0
+    meta_path = f"{OUTPUT_DIR}/train.txt"
+    metadata = []
+    
+    if os.path.exists(meta_path):
+        with open(meta_path, "r") as f:
+            metadata = f.read().splitlines()
 
-    logger.info("Starting processing loop...")
-    with torch.no_grad():
-        for idx, wav_path in enumerate(wav_files):
-            base = Path(wav_path).stem
-            txt_path = wav_path.replace(".wav", ".normalized.txt")
+    for wav_path in wav_files:
+        base_id = Path(wav_path).stem
+        
+        if base_id in completed_ids:
+            continue 
             
-            if not os.path.exists(txt_path):
-                skipped_count += 1
-                continue
+        emb_path = f"{OUTPUT_DIR}/{base_id}_embed.pt"
+        mel_path = f"{OUTPUT_DIR}/{base_id}_mel.pt"
+        txt_path = wav_path.replace(".wav", ".normalized.txt")
 
-            try:
-                text = Path(txt_path).read_text(encoding="utf-8").strip()
-                if len(text) < 2:
-                    skipped_count += 1
-                    continue
+        # INSTANT O(1) MEMORY LOOKUP instead of rglob
+        matching_npy = [f for name, f in npy_map.items() if base_id in name]
+        
+        if not matching_npy or not os.path.exists(txt_path):
+            continue
+            
+        npy_path = matching_npy[0]
+            
+        try:
+            # Identity Embedding
+            mel_40 = np.load(npy_path)
+            mel_40_t = torch.from_numpy(mel_40).float().to(device).T.unsqueeze(0) 
+            with torch.no_grad():
+                emb = model(mel_40_t).cpu()
 
-                # --- A. ENCODER PASS: Generate 40-bin mel at 16kHz using LIBROSA ---
-                try:
-                    wav_16k, _ = librosa.load(wav_path, sr=ENC_SAMPLE_RATE, mono=True)
-                    wav_16k_tensor = torch.from_numpy(wav_16k).unsqueeze(0).to(device)
-                except Exception as e:
-                    logger.warning(f"Librosa failed to load {base} at 16kHz: {e}")
-                    error_count += 1
-                    continue
-                
-                mel_40 = enc_mel_pipeline(wav_16k_tensor)  # [1, 40, T]
-                mel_40_input = mel_40.permute(0, 2, 1)  # [1, T, 40] for LSTM
-                
-                output = model(mel_40_input)
-                embedding = (output[0] if isinstance(output, tuple) else output).squeeze(0).cpu()
+            # Target Spectrogram
+            wav, _ = librosa.load(wav_path, sr=22050)
+            wav_t = torch.from_numpy(wav).unsqueeze(0).to(device)
+            mel_80 = mel_transform(wav_t).squeeze(0).cpu()
 
-                # --- B. TACOTRON PASS: Generate 80-bin mel at 22.05kHz using LIBROSA ---
-                try:
-                    wav_22k, _ = librosa.load(wav_path, sr=TACO_SAMPLE_RATE, mono=True)
-                    wav_22k_tensor = torch.from_numpy(wav_22k).unsqueeze(0).to(device)
-                except Exception as e:
-                    logger.warning(f"Librosa failed to load {base} at 22.05kHz: {e}")
-                    error_count += 1
-                    continue
-                    
-                mel_80 = taco_mel_pipeline(wav_22k_tensor).squeeze(0).cpu()  # [80, T]
+            # Save
+            text = Path(txt_path).read_text().strip()
+            torch.save(emb, emb_path)
+            torch.save(mel_80, mel_path)
+            metadata.append(f"{base_id}|{text}|{emb_path}|{mel_path}")
 
-                # --- C. SAVE TRIPLETS ---
-                emb_p = os.path.join(OUTPUT_DIR, f"{base}_embed.pt")
-                mel_p = os.path.join(OUTPUT_DIR, f"{base}_mel.pt")
-                
-                torch.save(embedding, emb_p)
-                torch.save(mel_80, mel_p)
-                metadata.append(f"{base}|{text}|{emb_p}|{mel_p}")
-                
-                processed_count += 1
-                
-                # Log progress every 100 files
-                if processed_count % 100 == 0:
-                    logger.info(f"📊 Progress: {processed_count}/{len(wav_files)} processed | Skipped: {skipped_count} | Errors: {error_count}")
-                
-                # Commit to volume every 500 files
-                if processed_count % LOG_INTERVAL == 0:
-                    logger.info(f"💾 Committing to volume at {processed_count} files...")
-                    volume.commit()
-                    logger.info("✅ Volume committed")
+            processed_count += 1
+            completed_ids.add(base_id) 
 
-            except Exception as e:
-                logger.warning(f"❌ Error processing {base}: {e}")
-                error_count += 1
+            if processed_count % 100 == 0:
+                print(f"📊 Progress: {len(completed_ids)}/{len(wav_files)} total | New this run: {processed_count}")
+            
+            if processed_count % 500 == 0:
+                with open(meta_path, "w") as f:
+                    f.write("\n".join(metadata))
+                volume.commit()
 
-    # Write metadata
-    logger.info(f"Writing metadata file...")
-    meta_path = os.path.join(OUTPUT_DIR, "train_metadata.txt")
-    Path(meta_path).write_text("\n".join(metadata), encoding="utf-8")
+        except Exception as e:
+            print(f"❌ ERROR on file {base_id}: {e}")
+            break
+
+    with open(meta_path, "w") as f:
+        f.write("\n".join(metadata))
     
-    logger.info(f"Final commit to volume...")
     volume.commit()
-    
-    logger.info("=" * 60)
-    logger.info(f"✅ PHASE 4 COMPLETE")
-    logger.info(f"📁 Output directory: {OUTPUT_DIR}")
-    logger.info(f"✅ Successfully processed: {processed_count} files")
-    logger.info(f"⏭️  Skipped (no text): {skipped_count} files")
-    logger.info(f"❌ Errors: {error_count} files")
-    logger.info(f"📄 Metadata entries: {len(metadata)}")
-    logger.info("=" * 60)
-
+    print("✅ Run Complete.")
 
 @app.local_entrypoint()
 def main():
     prepare_dataset.remote()
-
-if __name__ == "__main__":
-    main()
