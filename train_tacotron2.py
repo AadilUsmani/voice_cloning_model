@@ -189,139 +189,169 @@ def train_tacotron2():
     # --- Resume ---
     latest_ckpt = os.path.join(CHECKPOINT_DIR, "latest.pth")
     best_ckpt   = os.path.join(CHECKPOINT_DIR, "best.pth")
+    
+    # DEBUG: Check if checkpoint exists
+    if os.path.exists(latest_ckpt):
+        logger.info(f"✅ FOUND CHECKPOINT at {latest_ckpt}")
+    else:
+        logger.info(f"⚠️  NO CHECKPOINT FOUND at {latest_ckpt}")
+        if os.path.exists(CHECKPOINT_DIR):
+            existing_files = os.listdir(CHECKPOINT_DIR)
+            logger.info(f"   Files in {CHECKPOINT_DIR}: {existing_files if existing_files else 'EMPTY'}")
+        else:
+            logger.info(f"   Checkpoint directory does not exist yet")
+    
     global_step, start_epoch, best_loss = load_checkpoint(
         latest_ckpt, model, optimizer, scaler, device
     )
 
     logger.info("=" * 60 + "\n  STARTING TRAINING\n" + "=" * 60)
 
-    for epoch in range(start_epoch, EPOCHS):
-        model.train()
-        epoch_loss  = 0.0
-        pbar        = tqdm(dataloader, desc=f"Epoch {epoch+1}/{EPOCHS}")
-        needs_commit = False
+    try:  # Wrap entire training to ensure volume commit on interruption
+        for epoch in range(start_epoch, EPOCHS):
+            model.train()
+            epoch_loss  = 0.0
+            pbar        = tqdm(dataloader, desc=f"Epoch {epoch+1}/{EPOCHS}")
+            needs_commit = False
 
-        optimizer.zero_grad() # Initialize before the loop for accumulation
+            optimizer.zero_grad() # Initialize before the loop for accumulation
 
-        for batch_idx, batch in enumerate(pbar):
-            if batch is None:
-                continue
+            for batch_idx, batch in enumerate(pbar):
+                if batch is None:
+                    continue
 
-            global_step += 1
-            tf_ratio = teacher_forcing_ratio(global_step)
+                global_step += 1
+                tf_ratio = teacher_forcing_ratio(global_step)
 
-            text         = batch["text"].to(device)
-            text_lengths = batch["text_lengths"].to(device)
-            mel          = batch["mel_targets"].to(device)
-            mel_lengths  = batch["mel_lengths"].to(device)
-            embeddings   = batch["speaker_embeds"].to(device)
-            gate_targets = batch["gate_targets"].to(device)
+                text         = batch["text"].to(device)
+                text_lengths = batch["text_lengths"].to(device)
+                mel          = batch["mel_targets"].to(device)
+                mel_lengths  = batch["mel_lengths"].to(device)
+                embeddings   = batch["speaker_embeds"].to(device)
+                gate_targets = batch["gate_targets"].to(device)
 
-            with torch.amp.autocast("cuda", enabled=scaler is not None):
-                mel_postnet, mel_pred, stop_tokens, alignments = model(
-                    text, text_lengths, embeddings, mel, tf_ratio
-                )
-                loss, mel_loss, stop_loss = tacotron_loss(
-                    mel_pred, mel_postnet, mel,
-                    stop_tokens, gate_targets, mel_lengths
-                )
-
-            # CRITICAL VRAM FIX: Scale loss for gradient accumulation
-            loss = loss / GRADIENT_ACCUMULATION_STEPS
-
-            if scaler:
-                scaler.scale(loss).backward()
-                # Only step the optimizer every N steps
-                if (batch_idx + 1) % GRADIENT_ACCUMULATION_STEPS == 0 or (batch_idx + 1 == len(dataloader)):
-                    scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP_THRESH)
-                    scaler.step(optimizer)
-                    scaler.update()
-                    optimizer.zero_grad()
-                    torch.cuda.empty_cache()
-            else:
-                loss.backward()
-                if (batch_idx + 1) % GRADIENT_ACCUMULATION_STEPS == 0 or (batch_idx + 1 == len(dataloader)):
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP_THRESH)
-                    optimizer.step()
-                    optimizer.zero_grad()
-                    torch.cuda.empty_cache()
-
-            # For logging, multiply back to get the true loss value
-            loss_val    = loss.item() * GRADIENT_ACCUMULATION_STEPS
-            epoch_loss += loss_val
-            pbar.set_postfix(loss=f"{loss_val:.4f}", mel=f"{mel_loss.item():.4f}",
-                             stop=f"{stop_loss.item():.4f}", tf=f"{tf_ratio:.2f}")
-
-            # --- Periodic checkpoint ---
-            if global_step % CHECKPOINT_EVERY == 0:
-                try:
-                    save_checkpoint(latest_ckpt, model, optimizer, scaler,
-                                    global_step, epoch, loss_val)
-                    needs_commit = True
-                    logger.info(f"Checkpoint saved at step {global_step}")
-                except Exception as e:
-                    logger.error(f"Checkpoint save failed: {e}")
-
-            # --- Attention plot ---
-            if global_step % VISUALIZE_EVERY == 0:
-                try:
-                    plot_attention(
-                        alignments[0].detach().cpu().numpy(),
-                        global_step,
-                        os.path.join(ATTENTION_DIR, f"attention_step_{global_step}.png"),
+                with torch.amp.autocast("cuda", enabled=scaler is not None):
+                    mel_postnet, mel_pred, stop_tokens, alignments = model(
+                        text, text_lengths, embeddings, mel, tf_ratio
                     )
-                    needs_commit = True
-                except Exception as e:
-                    logger.error(f"Attention plot failed: {e}")
+                    loss, mel_loss, stop_loss = tacotron_loss(
+                        mel_pred, mel_postnet, mel,
+                        stop_tokens, gate_targets, mel_lengths
+                    )
 
-            # --- Inference sanity check ---
-            if global_step % INFERENCE_EVERY == 0:
-                model.eval()
-                with torch.no_grad():
+                # CRITICAL VRAM FIX: Scale loss for gradient accumulation
+                loss = loss / GRADIENT_ACCUMULATION_STEPS
+
+                if scaler:
+                    scaler.scale(loss).backward()
+                    # Only step the optimizer every N steps
+                    if (batch_idx + 1) % GRADIENT_ACCUMULATION_STEPS == 0 or (batch_idx + 1 == len(dataloader)):
+                        scaler.unscale_(optimizer)
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP_THRESH)
+                        scaler.step(optimizer)
+                        scaler.update()
+                        optimizer.zero_grad()
+                        torch.cuda.empty_cache()
+                else:
+                    loss.backward()
+                    if (batch_idx + 1) % GRADIENT_ACCUMULATION_STEPS == 0 or (batch_idx + 1 == len(dataloader)):
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP_THRESH)
+                        optimizer.step()
+                        optimizer.zero_grad()
+                        torch.cuda.empty_cache()
+
+                # For logging, multiply back to get the true loss value
+                loss_val    = loss.item() * GRADIENT_ACCUMULATION_STEPS
+                epoch_loss += loss_val
+                pbar.set_postfix(loss=f"{loss_val:.4f}", mel=f"{mel_loss.item():.4f}",
+                                 stop=f"{stop_loss.item():.4f}", tf=f"{tf_ratio:.2f}")
+
+                # --- Periodic checkpoint ---
+                if global_step % CHECKPOINT_EVERY == 0:
                     try:
-                        for i, sent in enumerate(TEST_SENTENCES):
-                            seq  = torch.LongTensor(text_to_sequence(sent)).unsqueeze(0).to(device)
-                            slen = torch.LongTensor([seq.size(1)]).to(device)
-                            emb  = embeddings[0:1]
+                        save_checkpoint(latest_ckpt, model, optimizer, scaler,
+                                        global_step, epoch, loss_val)
+                        volume.commit()  # CRITICAL: Immediate commit after save
+                        logger.info(f"✅ Checkpoint saved and committed at step {global_step}")
+                    except Exception as e:
+                        logger.error(f"❌ Checkpoint save failed: {e}")
 
-                            m_post, _, _, align = model(
-                                seq, slen, emb, mels=None, teacher_forcing_ratio=0.0
-                            )
-                            prefix = os.path.join(INFERENCE_DIR, f"step_{global_step}_test_{i}")
-                            torch.save(m_post.cpu(), f"{prefix}.pt")
-                            plot_attention(align[0].detach().cpu().numpy(),
-                                          global_step, f"{prefix}_attention.png")
+                # --- Attention plot ---
+                if global_step % VISUALIZE_EVERY == 0:
+                    try:
+                        plot_attention(
+                            alignments[0].detach().cpu().numpy(),
+                            global_step,
+                            os.path.join(ATTENTION_DIR, f"attention_step_{global_step}.png"),
+                        )
                         needs_commit = True
                     except Exception as e:
-                        logger.error(f"Inference test failed: {e}")
-                model.train()
+                        logger.error(f"Attention plot failed: {e}")
 
-            # Single commit per interval window
-            if needs_commit:
-                volume.commit()
-                needs_commit = False
+                # --- Inference sanity check ---
+                if global_step % INFERENCE_EVERY == 0:
+                    model.eval()
+                    with torch.no_grad():
+                        try:
+                            for i, sent in enumerate(TEST_SENTENCES):
+                                seq  = torch.LongTensor(text_to_sequence(sent)).unsqueeze(0).to(device)
+                                slen = torch.LongTensor([seq.size(1)]).to(device)
+                                emb  = embeddings[0:1]
 
-        # --- End of epoch ---
-        avg_loss = epoch_loss / len(dataloader)
-        scheduler.step(avg_loss)
-        current_lr = optimizer.param_groups[0]["lr"]
-        logger.info(
-            f"Epoch {epoch+1}/{EPOCHS} complete — "
-            f"avg_loss={avg_loss:.4f}  lr={current_lr:.2e}"
-        )
+                                m_post, _, _, align = model(
+                                    seq, slen, emb, mels=None, teacher_forcing_ratio=0.0
+                                )
+                                prefix = os.path.join(INFERENCE_DIR, f"step_{global_step}_test_{i}")
+                                torch.save(m_post.cpu(), f"{prefix}.pt")
+                                plot_attention(align[0].detach().cpu().numpy(),
+                                              global_step, f"{prefix}_attention.png")
+                            needs_commit = True
+                        except Exception as e:
+                            logger.error(f"Inference test failed: {e}")
+                    model.train()
 
-        if avg_loss < best_loss:
-            best_loss = avg_loss
-            try:
-                save_checkpoint(best_ckpt, model, optimizer, scaler,
-                                global_step, epoch, best_loss)
-                volume.commit()
-                logger.info(f"New best model saved (loss={best_loss:.4f})")
-            except Exception as e:
-                logger.error(f"Best checkpoint save failed: {e}")
+                # Commit attention/inference outputs periodically
+                if needs_commit:
+                    volume.commit()
+                    needs_commit = False
 
-    logger.info(f"Training complete. Best loss: {best_loss:.4f}")
+            # --- End of epoch ---
+            avg_loss = epoch_loss / len(dataloader)
+            scheduler.step(avg_loss)
+            current_lr = optimizer.param_groups[0]["lr"]
+            logger.info(
+                f"Epoch {epoch+1}/{EPOCHS} complete — "
+                f"avg_loss={avg_loss:.4f}  lr={current_lr:.2e}"
+            )
+
+            if avg_loss < best_loss:
+                best_loss = avg_loss
+                try:
+                    save_checkpoint(best_ckpt, model, optimizer, scaler,
+                                    global_step, epoch, best_loss)
+                    volume.commit()
+                    logger.info(f"✅ New best model saved and committed (loss={best_loss:.4f})")
+                except Exception as e:
+                    logger.error(f"Best checkpoint save failed: {e}")
+
+        logger.info(f"✅ Training complete. Best loss: {best_loss:.4f}")
+
+    except KeyboardInterrupt:
+        logger.info("⚠️  Training interrupted by user. Saving final state...")
+    except Exception as e:
+        logger.error(f"❌ Training crashed with error: {e}")
+        import traceback
+        traceback.print_exc()
+    finally:
+        # CRITICAL: Always commit final state, even on crash/interrupt
+        try:
+            logger.info("💾 Performing final checkpoint save...")
+            save_checkpoint(latest_ckpt, model, optimizer, scaler,
+                            global_step, epoch, loss_val if 'loss_val' in locals() else float('inf'))
+            volume.commit()
+            logger.info("✅ Final state committed to volume. Safe to exit.")
+        except Exception as e:
+            logger.error(f"❌ Final checkpoint commit failed: {e}")
 
 @app.local_entrypoint()
 def main():
