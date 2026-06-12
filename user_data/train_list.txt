@@ -1,0 +1,6 @@
+user_data\mels\clip1.pt|My name is Adil. I am a computer science student.
+user_data\mels\clip2.pt|This is a testing audio that serves the purpose of checking the preprocessing.
+user_data\mels\clip3.pt|preprocessing The idea is to check if the preprocessing part of the pipeline works.
+user_data\mels\clip4.pt|works And works as intended according to our pipeline and demands.
+user_data\mels\clip5.pt|If we are successful, we have completed the done phase of the module.
+user_data\mels\clip6.pt|Then we can move ahead and solve the remaining part of the pipeline.

@@ -27,6 +27,7 @@ image = (
 
 # --- Paths ---
 METADATA_PATH  = "/data/synthesizer_dataset/train.txt"
+VAL_METADATA_PATH = "/data/synthesizer_dataset/val.txt"
 CHECKPOINT_DIR = "/data/tacotron2_checkpoints"
 ATTENTION_DIR  = "/data/tacotron2_attention_plots"
 INFERENCE_DIR  = "/data/tacotron2_inference_samples"
@@ -147,6 +148,35 @@ def teacher_forcing_ratio(step: int) -> float:
 # ---------------------------------------------------------------
 # Training function
 # ---------------------------------------------------------------
+def validate(model, dataloader, device):
+    """Runs a fast validation pass without accumulating gradients."""
+    model.eval()
+    total_val_loss = 0.0
+    
+    with torch.no_grad():
+        for batch in dataloader:
+            if batch is None: continue
+                
+            text         = batch["text"].to(device)
+            text_lengths = batch["text_lengths"].to(device)
+            mel          = batch["mel_targets"].to(device)
+            mel_lengths  = batch["mel_lengths"].to(device)
+            embeddings   = batch["speaker_embeds"].to(device)
+            gate_targets = batch["gate_targets"].to(device)
+
+            # tf_ratio = 1.0 here for a pure acoustic loss baseline
+            with torch.amp.autocast("cuda", enabled=True):
+                mel_postnet, mel_pred, stop_tokens, _ = model(
+                    text, text_lengths, embeddings, mel, 1.0
+                )
+                loss, _, _ = tacotron_loss(
+                    mel_pred, mel_postnet, mel, stop_tokens, gate_targets, mel_lengths
+                )
+                
+            total_val_loss += loss.item()
+
+    model.train() # Immediately return to training mode
+    return total_val_loss / len(dataloader)
 @app.function(image=image, volumes={"/data": volume}, timeout=14400, gpu="T4")
 def train_tacotron2():
     logging.basicConfig(
@@ -174,7 +204,12 @@ def train_tacotron2():
         max_mel_frames=MAX_MEL_FRAMES
     )
     logger.info(f"Dataset ready — {len(dataloader)} batches/epoch")
-
+    val_dataloader = get_dataloader(
+        VAL_METADATA_PATH, 
+        batch_size=BATCH_SIZE, 
+        max_mel_frames=MAX_MEL_FRAMES
+    )
+    logger.info(f"Validation Dataset ready — {len(val_dataloader)} batches")
     # --- Model ---
     model = Tacotron2(
         vocab_size=len(VOCAB), n_mels=80, speaker_embedding_dim=256
@@ -316,21 +351,29 @@ def train_tacotron2():
                     needs_commit = False
 
             # --- End of epoch ---
-            avg_loss = epoch_loss / len(dataloader)
-            scheduler.step(avg_loss)
+            # --- End of epoch ---
+            avg_train_loss = epoch_loss / len(dataloader)
+            
+            # Run Validation
+            logger.info("Running validation pass...")
+            val_loss = validate(model, val_dataloader, device)
+            
+            scheduler.step(val_loss) # Scheduler now watches validation loss!
             current_lr = optimizer.param_groups[0]["lr"]
+            
             logger.info(
                 f"Epoch {epoch+1}/{EPOCHS} complete — "
-                f"avg_loss={avg_loss:.4f}  lr={current_lr:.2e}"
+                f"Train Loss: {avg_train_loss:.4f} | Val Loss: {val_loss:.4f} | lr: {current_lr:.2e}"
             )
 
-            if avg_loss < best_loss:
-                best_loss = avg_loss
+            # Save "Best" model based purely on Validation performance
+            if val_loss < best_loss:
+                best_loss = val_loss
                 try:
                     save_checkpoint(best_ckpt, model, optimizer, scaler,
                                     global_step, epoch, best_loss)
                     volume.commit()
-                    logger.info(f"✅ New best model saved and committed (loss={best_loss:.4f})")
+                    logger.info(f"✅ New best model saved and committed (Val Loss: {best_loss:.4f})")
                 except Exception as e:
                     logger.error(f"Best checkpoint save failed: {e}")
 

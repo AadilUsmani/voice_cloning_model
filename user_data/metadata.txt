@@ -1,0 +1,6 @@
+clip1.wav|My name is Adil. I am a computer science student.
+clip2.wav|This is a testing audio that serves the purpose of checking the preprocessing.
+clip3.wav|preprocessing The idea is to check if the preprocessing part of the pipeline works.
+clip4.wav|works And works as intended according to our pipeline and demands.
+clip5.wav|If we are successful, we have completed the done phase of the module.
+clip6.wav|Then we can move ahead and solve the remaining part of the pipeline.

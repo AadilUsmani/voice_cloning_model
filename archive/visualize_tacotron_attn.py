@@ -134,10 +134,6 @@ def plot_multiple_attentions(alignments, titles, save_path=None):
 def visualize_checkpoint_attention(checkpoint_path, save_dir=None):
     """
     Load a checkpoint and visualize its attention patterns
-    
-    Args:
-        checkpoint_path: Path to .pth checkpoint file
-        save_dir: Directory to save plots (if None, will display)
     """
     print(f"📂 Loading checkpoint from {checkpoint_path}")
     checkpoint = torch.load(checkpoint_path, map_location='cpu')
@@ -147,17 +143,15 @@ def visualize_checkpoint_attention(checkpoint_path, save_dir=None):
     
     print(f"✅ Loaded checkpoint at step {step}")
     print(f"   Loss: {checkpoint.get('loss', 'N/A')}")
-    
-    # Note: This is a utility function. Actual attention tensors need to be
-    # saved separately during training, as checkpoints only contain model weights.
     print("\n⚠️  To visualize attention, you need to save attention tensors during training.")
     print("   The training script already does this in the INFERENCE_DIR.")
 
 if __name__ == "__main__":
-    # Example: Generate synthetic attention pattern for testing
+    # =========================================================================
+    # PART 1: Synthetic Test (To verify your local matplotlib is working)
+    # =========================================================================
     print("🧪 Testing attention visualization with synthetic data...\n")
     
-    # Good diagonal alignment (what we want)
     decoder_steps = 200
     encoder_steps = 50
     good_attention = np.zeros((decoder_steps, encoder_steps))
@@ -167,45 +161,57 @@ if __name__ == "__main__":
             good_attention[t, e] = np.exp(-((e - center)**2) / 2)
     good_attention /= good_attention.sum(axis=1, keepdims=True)
     
-    # Bad attention (stuck on one character)
     bad_attention = np.zeros((decoder_steps, encoder_steps))
     bad_attention[:, 10] = 1.0
     
-    # Random attention (not converging)
     random_attention = np.random.rand(decoder_steps, encoder_steps)
     random_attention /= random_attention.sum(axis=1, keepdims=True)
     
-    # Plot examples
-    plot_attention(good_attention, "Good Alignment (Diagonal)", "test_good_attention.png")
-    plot_attention(bad_attention, "Bad Alignment (Mode Collapse)", "test_bad_attention.png")
-    plot_attention(random_attention, "Bad Alignment (Not Converging)", "test_random_attention.png")
-    
-    # Analyze quality
-    print("\n📊 Attention Quality Analysis:")
-    print("\n1. Good Alignment:")
-    metrics = analyze_attention_quality(good_attention)
-    for key, value in metrics.items():
-        print(f"   {key}: {value:.3f}")
-    
-    print("\n2. Bad Alignment (Mode Collapse):")
-    metrics = analyze_attention_quality(bad_attention)
-    for key, value in metrics.items():
-        print(f"   {key}: {value:.3f}")
-    
-    print("\n3. Random Alignment (Not Converging):")
-    metrics = analyze_attention_quality(random_attention)
-    for key, value in metrics.items():
-        print(f"   {key}: {value:.3f}")
-    
-    # Comparison plot
     plot_multiple_attentions(
         [good_attention, bad_attention, random_attention],
         ["Good (Diagonal)", "Bad (Mode Collapse)", "Bad (Random)"],
         "test_attention_comparison.png"
     )
+    print("✅ Test plot generated: test_attention_comparison.png\n")
+
+
+    # =========================================================================
+    # PART 2: Actual 50,000 Step Model Data Analysis
+    # =========================================================================
+    print("🔍 Analyzing Actual Step 50,000 Data...")
     
-    print("\n✅ Test plots generated successfully!")
-    print("   - test_good_attention.png")
-    print("   - test_bad_attention.png")
-    print("   - test_random_attention.png")
-    print("   - test_attention_comparison.png")
+    # Using the exact absolute path from your terminal output
+    target_file = r"D:\Desktop\CS\CS\fyp-voice-clone\training_progress\steps\step_50000_test_1.pt"
+    
+    try:
+        # Load the test file you just downloaded
+        real_data = torch.load(target_file, map_location='cpu', weights_only=False)
+        
+        # Check if the data is wrapped in a dictionary or saved as a raw tensor
+        if isinstance(real_data, dict) and 'attention' in real_data:
+            real_alignment = real_data['attention']
+        else:
+            real_alignment = real_data 
+            
+        # Clean up the tensor dimensions
+        if torch.is_tensor(real_alignment):
+            real_alignment = real_alignment.squeeze().cpu().numpy()
+            
+        # Plot the actual FYP attention and save it
+        plot_attention(real_alignment, "Actual 50,000 Step Alignment", "actual_50k_attention.png")
+        
+        # Calculate and print the hard mathematical scores
+        print("\n📈 50k Model Scores (Put these in your FYP Documentation):")
+        print("-" * 50)
+        real_metrics = analyze_attention_quality(real_alignment)
+        for key, value in real_metrics.items():
+            print(f"   {key.replace('_', ' ').title()}: {value:.4f}")
+        print("-" * 50)
+        print("\n✅ Successfully analyzed and saved: actual_50k_attention.png")
+            
+    except FileNotFoundError:
+        print(f"\n❌ Error: Could not find the file at {target_file}")
+        print("Make sure you downloaded it from Modal to that exact folder.")
+    except Exception as e:
+        print(f"\n❌ Could not load or parse real data. Error details: {e}")
+        

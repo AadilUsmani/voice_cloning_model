@@ -76,13 +76,15 @@ class SynthesizerDataset(Dataset):
         Lazy-loads tensors with bounded retries.
         Skips samples that are missing, corrupt, or exceed MAX_MEL_FRAMES.
         """
-        for attempt in range(MAX_LOAD_RETRIES):
+        # Increased to 50 attempts to protect tiny validation datasets
+        for attempt in range(50):
             item = self.data[idx]
             try:
                 mel = torch.load(item["mel_path"], weights_only=True).float()  # [80, T]
 
                 if mel.shape[1] > self.max_mel_frames:
-                    idx = random.randint(0, len(self.data) - 1)
+                    # Move to the NEXT file sequentially instead of random jumping
+                    idx = (idx + 1) % len(self.data)
                     continue
 
                 embedding = torch.load(item["emb_path"], weights_only=True).float()  # [256]
@@ -96,15 +98,14 @@ class SynthesizerDataset(Dataset):
                 }
 
             except Exception as e:
-                logger.warning(f"[attempt {attempt+1}/{MAX_LOAD_RETRIES}] "
-                               f"Failed to load {item['base_id']}: {e}")
-                idx = random.randint(0, len(self.data) - 1)
+                # logger.warning(f"[attempt {attempt+1}/50] Failed to load {item['base_id']}: {e}")
+                # Move to the NEXT file sequentially
+                idx = (idx + 1) % len(self.data)
 
         raise RuntimeError(
-            f"Could not load a valid sample after {MAX_LOAD_RETRIES} attempts. "
+            "Could not load a valid sample after 50 sequential attempts. "
             "Check your synthesizer_dataset volume for corruption."
         )
-
 
 # ==========================================
 # 3. BATCH COLLATOR
